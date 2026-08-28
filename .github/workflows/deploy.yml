@@ -1,0 +1,311 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [production, staging]
+        default: production
+
+# Only one deploy at a time; cancel queued deploys if a new push arrives
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false  # don't cancel in-progress deploy — let it finish
+
+permissions:
+  contents: read
+  deployments: write
+
+env:
+  VPS_HOST: 89.116.157.98
+  VPS_USER: gacoka
+  DEPLOY_PATH: /var/www/app          # override in repo vars if different
+  HEALTHCHECK_URL: http://89.116.157.98  # override with your domain
+
+jobs:
+  # ── PRE-DEPLOY GATE ──────────────────────────────────────────────────────
+  gate:
+    name: Pre-deploy gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha_short: ${{ steps.meta.outputs.sha_short }}
+      deploy_path: ${{ steps.meta.outputs.deploy_path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build metadata
+        id: meta
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "deploy_path=${DEPLOY_PATH}" >> "$GITHUB_OUTPUT"
+          echo "Deploying commit $(git rev-parse --short HEAD) to ${VPS_HOST}"
+
+      - name: Verify SSH secret is set
+        run: |
+          if [ -z "${{ secrets.VPS_SSH_KEY }}" ]; then
+            echo "::error::VPS_SSH_KEY secret is not set."
+            echo "Add your SSH private key:"
+            echo "  Repo → Settings → Secrets → Actions → VPS_SSH_KEY"
+            exit 1
+          fi
+          echo "SSH key present."
+
+  # ── BUILD ────────────────────────────────────────────────────────────────
+  build:
+    name: Build
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect runtime and build
+        run: |
+          if [ -f "package.json" ]; then
+            node_version=$(node -e "try{const e=require('./package.json');console.log(e.engines?.node||'20')}catch{console.log('20')}" 2>/dev/null || echo "20")
+            echo "NODE_VERSION=${node_version}" >> "$GITHUB_ENV"
+            echo "RUNTIME=node" >> "$GITHUB_ENV"
+          elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+            echo "RUNTIME=python" >> "$GITHUB_ENV"
+          elif [ -f "go.mod" ]; then
+            echo "RUNTIME=go" >> "$GITHUB_ENV"
+          elif [ -f "Cargo.toml" ]; then
+            echo "RUNTIME=rust" >> "$GITHUB_ENV"
+          else
+            echo "RUNTIME=static" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup Node
+        if: env.RUNTIME == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION || '20' }}
+          cache: npm
+
+      - name: Build (Node)
+        if: env.RUNTIME == 'node'
+        run: |
+          npm ci --prefer-offline
+          npm run build 2>/dev/null || echo "No build script — deploying source."
+        env:
+          NODE_ENV: production
+
+      - name: Setup Python
+        if: env.RUNTIME == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build (Python)
+        if: env.RUNTIME == 'python'
+        run: |
+          pip install build 2>/dev/null || true
+          python -m build 2>/dev/null || echo "No build step — deploying source."
+
+      - name: Build (Go — compile binary)
+        if: env.RUNTIME == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Compile (Go)
+        if: env.RUNTIME == 'go'
+        run: |
+          GOOS=linux GOARCH=amd64 go build -o app-linux-amd64 ./...
+
+      - name: Build (Rust — release binary)
+        if: env.RUNTIME == 'rust'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Compile (Rust)
+        if: env.RUNTIME == 'rust'
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Create deploy archive
+        run: |
+          # Build the list of files to include
+          # Excludes: dev dependencies, test files, CI configs, git history
+          tar czf deploy.tar.gz \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='.venv' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='target' \
+            --exclude='coverage' \
+            --exclude='test-results' \
+            --exclude='.github' \
+            --exclude='*.test.*' \
+            --exclude='*.spec.*' \
+            --exclude='__tests__' \
+            --exclude='tests' \
+            .
+          echo "Archive size: $(du -sh deploy.tar.gz | cut -f1)"
+
+      - name: Upload deploy artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-${{ needs.gate.outputs.sha_short }}
+          path: deploy.tar.gz
+          retention-days: 3
+
+  # ── DEPLOY ───────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy → VPS
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: https://gacoka.com
+    steps:
+      - name: Download deploy artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-${{ needs.gate.outputs.sha_short }}
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${VPS_HOST}" >> ~/.ssh/known_hosts 2>/dev/null
+        env:
+          VPS_HOST: ${{ env.VPS_HOST }}
+
+      - name: Ship archive to VPS
+        run: |
+          scp -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            deploy.tar.gz \
+            "${VPS_USER}@${VPS_HOST}:/tmp/deploy-${{ needs.gate.outputs.sha_short }}.tar.gz"
+
+      - name: Deploy on VPS
+        run: |
+          SHA="${{ needs.gate.outputs.sha_short }}"
+          DEPLOY_PATH="${{ needs.gate.outputs.deploy_path }}"
+
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "${VPS_USER}@${VPS_HOST}" bash -s << EOF
+            set -euo pipefail
+
+            DEPLOY_PATH="${DEPLOY_PATH}"
+            SHA="${SHA}"
+            RELEASE_DIR="\${DEPLOY_PATH}/releases/\${SHA}"
+            CURRENT="\${DEPLOY_PATH}/current"
+            ARCHIVE="/tmp/deploy-\${SHA}.tar.gz"
+
+            echo "==> Preparing release directory"
+            mkdir -p "\${RELEASE_DIR}"
+            tar xzf "\${ARCHIVE}" -C "\${RELEASE_DIR}"
+            rm "\${ARCHIVE}"
+
+            echo "==> Installing dependencies"
+            cd "\${RELEASE_DIR}"
+
+            # Node
+            if [ -f "package.json" ]; then
+              export NODE_ENV=production
+              npm ci --omit=dev --prefer-offline 2>/dev/null || npm install --production
+            fi
+
+            # Python
+            if [ -f "requirements.txt" ]; then
+              python3 -m pip install -r requirements.txt --quiet
+            elif [ -f "pyproject.toml" ]; then
+              pip3 install -e . --quiet 2>/dev/null || true
+            fi
+
+            echo "==> Copying environment file"
+            if [ -f "\${DEPLOY_PATH}/.env" ]; then
+              cp "\${DEPLOY_PATH}/.env" "\${RELEASE_DIR}/.env"
+            fi
+
+            echo "==> Switching to new release (atomic symlink swap)"
+            ln -sfn "\${RELEASE_DIR}" "\${CURRENT}"
+
+            echo "==> Restarting application"
+            # PM2 (Node)
+            if command -v pm2 >/dev/null 2>&1; then
+              cd "\${CURRENT}"
+              pm2 reload ecosystem.config.js --env production 2>/dev/null || \
+              pm2 restart all 2>/dev/null || \
+              pm2 start ecosystem.config.js --env production 2>/dev/null || \
+              pm2 start npm --name app -- start
+              pm2 save
+            # systemd
+            elif systemctl list-units --type=service | grep -q "app.service"; then
+              sudo systemctl reload-or-restart app.service
+            # Gunicorn (Python)
+            elif command -v gunicorn >/dev/null 2>&1; then
+              sudo systemctl reload-or-restart gunicorn 2>/dev/null || \
+              pkill -HUP gunicorn 2>/dev/null || true
+            else
+              echo "::warning::No process manager found — restart manually."
+            fi
+
+            echo "==> Cleaning up old releases (keeping last 5)"
+            ls -1dt "\${DEPLOY_PATH}/releases"/*/ 2>/dev/null | tail -n +6 | xargs rm -rf || true
+
+            echo "==> Deploy complete: \${SHA}"
+          EOF
+
+      - name: Health check
+        run: |
+          echo "Waiting 15s for app to come up..."
+          sleep 15
+
+          MAX_RETRIES=6
+          RETRY=0
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 10 \
+              "${HEALTHCHECK_URL}" 2>/dev/null || echo "000")
+
+            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 400 ]; then
+              echo "✅ Health check passed (HTTP ${STATUS})"
+              exit 0
+            fi
+
+            RETRY=$((RETRY + 1))
+            echo "Attempt ${RETRY}/${MAX_RETRIES}: HTTP ${STATUS} — retrying in 10s..."
+            sleep 10
+          done
+
+          echo "::error::Health check failed after ${MAX_RETRIES} attempts. Rolling back."
+          exit 1
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "==> Rolling back to previous release"
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "${VPS_USER}@${VPS_HOST}" bash -s << 'EOF'
+            set -euo pipefail
+            DEPLOY_PATH="${DEPLOY_PATH}"
+
+            # Find the second-most-recent release (previous good one)
+            PREV=$(ls -1dt "${DEPLOY_PATH}/releases"/*/ 2>/dev/null | sed -n '2p')
+            if [ -n "$PREV" ]; then
+              ln -sfn "$PREV" "${DEPLOY_PATH}/current"
+              echo "Rolled back to: $PREV"
+              pm2 restart all 2>/dev/null || systemctl restart app.service 2>/dev/null || true
+            else
+              echo "No previous release to roll back to."
+            fi
+          EOF
+        env:
+          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
