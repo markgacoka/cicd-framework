@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  release:
+    name: Changelog and release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Skip release commits themselves to avoid loops
+    if: |
+      !contains(github.event.head_commit.message, '[skip release]') &&
+      !startsWith(github.event.head_commit.message, 'chore(release)')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine version bump
+        id: version
+        run: |
+          # Get the latest tag (or start from 0.0.0)
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "latest_tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
+
+          # Parse current version
+          VERSION="${LATEST_TAG#v}"
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
+
+          # Determine bump from commit messages since last tag
+          COMMITS=$(git log "${LATEST_TAG}..HEAD" --pretty=format:"%s" 2>/dev/null || \
+                    git log --pretty=format:"%s")
+
+          BUMP="none"
+
+          # Breaking change (feat! or fix! or BREAKING CHANGE in body)
+          if echo "$COMMITS" | grep -qE '^(feat|fix|refactor)!:' || \
+             git log "${LATEST_TAG}..HEAD" --pretty=format:"%b" 2>/dev/null | grep -qi "BREAKING CHANGE"; then
+            BUMP="major"
+          # New feature
+          elif echo "$COMMITS" | grep -qE '^feat(\(.+\))?:'; then
+            BUMP="minor"
+          # Bug fix or performance
+          elif echo "$COMMITS" | grep -qE '^(fix|perf)(\(.+\))?:'; then
+            BUMP="patch"
+          fi
+
+          echo "bump=${BUMP}" >> "$GITHUB_OUTPUT"
+
+          # Calculate new version
+          case "$BUMP" in
+            major) NEW_VERSION="$((MAJOR + 1)).0.0" ;;
+            minor) NEW_VERSION="${MAJOR}.$((MINOR + 1)).0" ;;
+            patch) NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
+            *)     NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}" ;;
+          esac
+
+          echo "new_version=v${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${LATEST_TAG} → v${NEW_VERSION} (${BUMP} bump)"
+
+      - name: Generate changelog
+        id: changelog
+        if: steps.version.outputs.bump != 'none'
+        run: |
+          LATEST_TAG="${{ steps.version.outputs.latest_tag }}"
+          NEW_VERSION="${{ steps.version.outputs.new_version }}"
+          DATE=$(date +%Y-%m-%d)
+
+          # Get merged PRs since last tag
+          RANGE="${LATEST_TAG}..HEAD"
+          if ! git rev-parse "$LATEST_TAG" >/dev/null 2>&1; then
+            RANGE="HEAD"
+          fi
+
+          # Build changelog sections
+          BREAKING=$(git log $RANGE --pretty=format:"- %s" | grep -E '^- (feat|fix|refactor)!:' | \
+                     sed 's/^- [^!]*!: /- /' || true)
+          FEATURES=$(git log $RANGE --pretty=format:"- %s" | grep -E '^- feat(\(.+\))?:' | \
+                     sed 's/^- feat[^:]*: /- /' || true)
+          FIXES=$(git log $RANGE --pretty=format:"- %s" | grep -E '^- (fix|perf)(\(.+\))?:' | \
+                  sed 's/^- (fix|perf)[^:]*: /- /' || true)
+          CHORES=$(git log $RANGE --pretty=format:"- %s" | grep -E '^- (chore|ci|docs|style|refactor|test)(\(.+\))?:' | \
+                   sed 's/^- [a-z]*[^:]*: /- /' || true)
+
+          # Write CHANGELOG entry
+          ENTRY="## ${NEW_VERSION} — ${DATE}
+
+          $( [ -n "$BREAKING" ] && echo -e "### ⚠️ Breaking Changes\n${BREAKING}\n" )
+          $( [ -n "$FEATURES" ] && echo -e "### ✨ Features\n${FEATURES}\n" )
+          $( [ -n "$FIXES" ] && echo -e "### 🐛 Bug Fixes\n${FIXES}\n" )
+          $( [ -n "$CHORES" ] && echo -e "### 🔧 Maintenance\n${CHORES}\n" )"
+
+          echo "$ENTRY"
+
+          # Prepend to CHANGELOG.md
+          if [ -f "CHANGELOG.md" ]; then
+            echo -e "${ENTRY}\n\n---\n" | cat - CHANGELOG.md > /tmp/CHANGELOG.tmp
+          else
+            echo -e "# Changelog\n\n${ENTRY}" > /tmp/CHANGELOG.tmp
+          fi
+          mv /tmp/CHANGELOG.tmp CHANGELOG.md
+
+          # Save for release notes
+          echo "entry<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$ENTRY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Commit changelog and tag
+        if: steps.version.outputs.bump != 'none'
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.new_version }}"
+
+          git add CHANGELOG.md
+          git commit -m "chore(release): ${NEW_VERSION} [skip release]" || true
+          git push
+
+          # Create annotated tag
+          git tag -a "$NEW_VERSION" -m "Release ${NEW_VERSION}"
+          git push origin "$NEW_VERSION"
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.bump != 'none'
+        run: |
+          gh release create "${{ steps.version.outputs.new_version }}" \
+            --title "Release ${{ steps.version.outputs.new_version }}" \
+            --notes "${{ steps.changelog.outputs.entry }}" \
+            --latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: No release needed
+        if: steps.version.outputs.bump == 'none'
+        run: |
+          echo "No releasable commits found (need feat:, fix:, or breaking change). Skipping release."

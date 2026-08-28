@@ -1,0 +1,43 @@
+# Environment
+.env
+.env.local
+.env.*.local
+*.env
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+target/
+vendor/
+
+# Build output
+dist/
+build/
+out/
+.next/
+.nuxt/
+
+# Test artifacts
+coverage/
+.coverage
+*.lcov
+test-results/
+junit.xml
+pytest-results.xml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*

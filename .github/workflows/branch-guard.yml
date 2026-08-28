@@ -1,0 +1,121 @@
+name: Branch guard
+
+on:
+  push:
+    branches-ignore: [main, develop]
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main, develop]
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  # ── BRANCH NAME VALIDATION ───────────────────────────────────────────────
+  branch-name:
+    name: Branch name
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Validate branch name
+        run: |
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          echo "Checking branch: ${BRANCH}"
+
+          # Allowed patterns
+          VALID_PATTERN='^(feature|fix|hotfix|chore|release|ci|docs|test|refactor|perf)/[a-z0-9][a-z0-9._-]*[a-z0-9]$'
+
+          if echo "$BRANCH" | grep -qE "$VALID_PATTERN"; then
+            echo "✅ Branch name is valid: ${BRANCH}"
+          else
+            echo "❌ Invalid branch name: ${BRANCH}"
+            echo ""
+            echo "Branch names must follow the pattern:"
+            echo "  <type>/<description>"
+            echo ""
+            echo "Valid types: feature | fix | hotfix | chore | release | ci | docs | test | refactor | perf"
+            echo "Description: lowercase letters, numbers, hyphens, dots (no uppercase, no spaces)"
+            echo ""
+            echo "Examples:"
+            echo "  feature/123-add-strava-integration"
+            echo "  fix/456-null-pointer-in-flight-log"
+            echo "  hotfix/auth-token-leak"
+            echo "  chore/upgrade-dependencies"
+            echo "  release/v2.1.0"
+            echo ""
+            echo "Rename your branch:"
+            echo "  git branch -m ${BRANCH} feature/your-description"
+            echo "  git push origin -u feature/your-description"
+            exit 1
+          fi
+
+  # ── PR TARGET VALIDATION ─────────────────────────────────────────────────
+  pr-target:
+    name: PR target
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Validate PR target branch
+        run: |
+          SOURCE="${{ github.head_ref }}"
+          TARGET="${{ github.base_ref }}"
+
+          echo "PR: ${SOURCE} → ${TARGET}"
+
+          # hotfix/* can target main or develop
+          if echo "$SOURCE" | grep -q "^hotfix/"; then
+            if [ "$TARGET" = "main" ] || [ "$TARGET" = "develop" ]; then
+              echo "✅ Hotfix → ${TARGET} is allowed"
+              exit 0
+            else
+              echo "❌ hotfix/* branches must target main or develop, not ${TARGET}"
+              exit 1
+            fi
+          fi
+
+          # release/* must target main
+          if echo "$SOURCE" | grep -q "^release/"; then
+            if [ "$TARGET" = "main" ]; then
+              echo "✅ release → main is allowed"
+              exit 0
+            else
+              echo "❌ release/* branches must target main, not ${TARGET}"
+              exit 1
+            fi
+          fi
+
+          # Everything else must target develop (not main directly)
+          if [ "$TARGET" = "main" ]; then
+            echo "❌ Only release/* and hotfix/* branches may target main directly."
+            echo "   Please retarget to develop: gh pr edit --base develop"
+            exit 1
+          fi
+
+          echo "✅ PR target is valid: ${SOURCE} → ${TARGET}"
+
+  # ── PR DESCRIPTION CHECK ─────────────────────────────────────────────────
+  pr-description:
+    name: PR description
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Check PR description is not empty
+        run: |
+          BODY="${{ github.event.pull_request.body }}"
+
+          if [ -z "$BODY" ] || [ "${#BODY}" -lt 20 ]; then
+            echo "::warning::PR description is too short. Add context: what changes, why, how to test."
+          else
+            echo "✅ PR description is present."
+          fi
+
+          # Check for linked issue (good practice, not blocking)
+          if echo "$BODY" | grep -qiE '(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#[0-9]+'; then
+            echo "✅ PR links to an issue."
+          else
+            echo "::notice::Consider linking a related issue: 'Closes #123'"
+          fi

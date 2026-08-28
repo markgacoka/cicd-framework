@@ -1,0 +1,168 @@
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main, develop]
+
+# Read repo, write PR comments
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Code review
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Skip draft PRs unless explicitly ready
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for accurate diff
+
+      - name: Claude Code PR review
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          allowed_tools: "Bash,Read,Glob,Grep"
+          max_turns: "30"
+          timeout_seconds: "1500"
+          prompt: |
+            You are performing a comprehensive code review of PR #${{ github.event.pull_request.number }}
+            titled "${{ github.event.pull_request.title }}" in the repo ${{ github.repository }}.
+
+            ## Your job
+            Review every changed file for architecture, security, code quality, and testing.
+            Post findings as GitHub inline comments and one top-level summary.
+
+            ## Critical Rules
+            1. ONLY post GitHub comments — never output review text as conversation.
+            2. NEVER modify any files — read-only review.
+            3. NEVER approve or merge the PR.
+            4. NEVER run code from the PR.
+            5. Check for existing comments before posting to avoid duplicates.
+            6. Post findings before you run out of turns.
+
+            ## Severity Levels
+            | Level | Label | Meaning |
+            |---|---|---|
+            | 🔴 P0 | Critical | Security vuln, data loss, broken functionality — BLOCKS merge |
+            | 🟠 P1 | High | Significant bug, architectural violation — SHOULD fix |
+            | 🟡 P2 | Medium | Code smell, minor bug risk, missing edge case — fix or track |
+            | 🟢 P3 | Low | Style nit, naming suggestion — optional, summary only |
+
+            ## Workflow
+
+            ### Step 1: Gather context
+            ```bash
+            gh pr view ${{ github.event.pull_request.number }} --json number,title,body,baseRefName,headRefName,additions,deletions,changedFiles
+            COMMIT_ID=$(gh pr view ${{ github.event.pull_request.number }} --json commits -q '.commits[-1].oid')
+            gh pr diff ${{ github.event.pull_request.number }} --stat
+            gh pr diff ${{ github.event.pull_request.number }}
+            cat CLAUDE.md 2>/dev/null || true
+            cat AGENTS.md 2>/dev/null || true
+            ```
+
+            ### Step 2: Check existing comments (dedup)
+            ```bash
+            gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments" \
+              --jq '[.[] | {path, line, body: .body[0:120]}]'
+            ```
+
+            ### Step 3: Review each changed file against
+
+            **Architecture and SOLID:**
+            - SRP: one reason to change per module
+            - OCP: extensible without modifying existing code
+            - LSP: subclasses honor parent contracts
+            - ISP: no forced dependency on unused interfaces
+            - DIP: depend on abstractions, not concretions
+            - Project conventions from CLAUDE.md and AGENTS.md
+
+            **Security (OWASP Top 10 + extras):**
+            - A01 Broken access control — missing auth guards, IDOR, privilege escalation
+            - A02 Cryptographic failures — weak algos, hardcoded secrets, missing encryption
+            - A03 Injection — SQL, NoSQL, command, XSS
+            - A05 Misconfiguration — debug mode, permissive CORS, missing headers
+            - A10 SSRF — user-controlled URLs reaching internal services
+            - Race conditions — TOCTOU, check-then-act, concurrent state
+            - JWT — signature, expiry, issuer, audience, algorithm pinning
+            - Secrets in code — API keys, tokens, credentials committed to source
+
+            **Code quality:**
+            - Error handling — swallowed exceptions, async errors, missing cleanup
+            - Performance — N+1 queries, expensive ops in loops, missing pagination
+            - Boundaries — null/undefined, empty collections, off-by-one
+            - Test coverage — new features tested? bug fixes have regression tests?
+
+            ### Step 4: Post inline comments for P0, P1, P2
+            ```bash
+            OWNER=$(echo "${{ github.repository }}" | cut -d/ -f1)
+            REPO=$(echo "${{ github.repository }}" | cut -d/ -f2)
+            COMMIT_ID=$(gh pr view ${{ github.event.pull_request.number }} --json commits -q '.commits[-1].oid')
+
+            gh api -X POST "repos/${OWNER}/${REPO}/pulls/${{ github.event.pull_request.number }}/comments" \
+              -f commit_id="${COMMIT_ID}" \
+              -f body="🔴 **[P0 — Critical]** <title>
+
+            **Problem:** <what is wrong and where>
+
+            **Why it matters:** <risk — security, data integrity, user-facing bug>
+
+            **Fix:**
+            \`\`\`suggestion
+            // corrected code
+            \`\`\`" \
+              -f path="<file>" \
+              -F line=<N> \
+              -f side="RIGHT"
+            ```
+
+            ### Step 5: Post top-level summary
+            ```bash
+            gh pr comment ${{ github.event.pull_request.number }} --body "## 🔍 Code Review
+
+            📊 **Files reviewed:** X · **Lines changed:** +Y / -Z
+            📋 **Verdict:** REQUEST_CHANGES | COMMENT | APPROVE
+
+            ---
+
+            ### 🔴 P0 — Critical
+            <!-- list or omit section -->
+
+            ### 🟠 P1 — High
+            <!-- list or omit section -->
+
+            ### 🟡 P2 — Medium
+            <!-- list or omit section -->
+
+            ### 🟢 P3 — Low (nits)
+            <!-- list or omit section -->
+
+            ---
+
+            ### ✅ Strengths
+            <!-- specific positives -->
+
+            ---
+
+            **Verdict logic:** REQUEST_CHANGES if any P0 · COMMENT if P1+ only · APPROVE if P2/P3 only or clean
+
+            *🤖 Claude Code PR Review*"
+            ```
+
+            **Verdict:**
+            - REQUEST_CHANGES — any P0 finding
+            - COMMENT — no P0, one or more P1
+            - APPROVE — P2/P3 only or clean
+
+            P3 items go in the summary only — no inline comments for nits.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
